@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -31,10 +32,13 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
+    HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
     encode_host_frame,
 )
+from omnigent.onboarding.harness_install import ui_install_key, ui_installable_harnesses
+from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
@@ -59,6 +63,19 @@ _LIST_DIR_MAX_LIMIT = 1000
 # fast syscall on the host side; 5s matches list_dir and is generous
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
+# Per-call timeout for host.install_harness round-trips. The host runs
+# `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
+# then recomputes readiness and sends the result back over the tunnel. The
+# server must wait comfortably longer than the 300s subprocess ceiling, not
+# just a hair over it: a cold npm install can run near the full cap, and the
+# readiness recompute + tunnel round-trip add more on top. 420s (300s + 2min
+# headroom) keeps a genuine slow install from timing out at the server while
+# the host is still succeeding — a "504 but actually installed" outcome.
+_INSTALL_HARNESS_TIMEOUT_S = 420.0
+# Env var that opts a deployment into the UI harness-install feature (default
+# off). Named once here and shared by the route (this file) and the /v1/info
+# flag in app.py so the two reads can never diverge on a typo.
+HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 
 
 async def _proxy_list_dir(
@@ -193,6 +210,64 @@ async def _proxy_create_dir(
         host_conn.pending_create_dirs.pop(request_id, None)
 
 
+async def _proxy_install_harness(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    harness: str,
+) -> dict[str, Any]:
+    """
+    Send a ``host.install_harness`` frame and await the result.
+
+    Mirrors :func:`_proxy_create_dir`: register a future on the host
+    connection's ``pending_installs`` map, enqueue the frame, await with a
+    timeout, and clean up in a finally block. ``host_tunnel.py``'s receive
+    loop resolves the future when the result frame arrives.
+
+    :param host_registry: Server-side registry; used to enqueue the outbound
+        frame on the host's send queue.
+    :param host_conn: Live host connection.
+    :param harness: The UI harness identifier to install, e.g. ``"claude"``.
+    :returns: Dict with the result fields: ``status`` (``"ok"`` /
+        ``"failed"``), ``configured_harnesses`` (the refreshed readiness map or
+        ``None``), ``error`` (string or ``None``).
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_installs[request_id] = future
+
+    frame = encode_host_frame(
+        HostInstallHarnessFrame(
+            request_id=request_id,
+            harness=harness,
+        )
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to install_harness "
+                    f"within {_INSTALL_HARNESS_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        # Cleanup runs on every path so a cancelled caller doesn't
+        # leave an orphan in the pending dict.
+        host_conn.pending_installs.pop(request_id, None)
+
+
 class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
@@ -215,12 +290,15 @@ class LaunchRunnerRequest(BaseModel):
         ``"/Users/corey/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
         the runner starts in the created worktree instead.
-    :param git: Optional git worktree options. When set, the server
-        creates a worktree for a new branch off ``workspace`` on the
-        host and binds the runner to it (the fork-resume path; mirrors
-        ``POST /v1/sessions``). ``None`` binds ``workspace`` directly.
-        ``host_id`` is always present (it is in the path), so no
-        host requirement check is needed here.
+    :param git: Optional git worktree options. In create mode the
+        server creates a worktree for a new branch off ``workspace`` on
+        the host and binds the runner to it (the fork-resume path;
+        mirrors ``POST /v1/sessions``). In bind mode
+        (``existing_worktree=True``) ``workspace`` already IS a
+        worktree — no worktree is created; ``branch_name`` is recorded
+        as the session's ``git_branch`` for display and opt-in cleanup.
+        ``None`` binds ``workspace`` directly. ``host_id`` is always
+        present (it is in the path), so no host check is needed here.
     """
 
     session_id: str
@@ -352,7 +430,7 @@ def create_hosts_router(
                 {
                     "host_id": host.host_id,
                     "name": host.name,
-                    "owner": host.owner,
+                    "owner": host.user_id,
                     "status": "online" if host_is_live(host, now=now) else "offline",
                     # Non-None marks a server-managed sandbox host (e.g.
                     # "modal"). Clients use it to hide sandbox-backed
@@ -384,7 +462,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         # Status comes from the DB so the answer is consistent across
@@ -393,7 +471,7 @@ def create_hosts_router(
         return {
             "host_id": host.host_id,
             "name": host.name,
-            "owner": host.owner,
+            "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
@@ -483,39 +561,52 @@ def create_hosts_router(
         # lost CAS or a failed launch can roll it back, leaving no orphan
         # worktree on the host.
         git_branch: str | None = None
-        worktree = None  # CreatedWorktree | None — set when body.git is used
+        # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
+        # (create mode). Left None in bind mode so the rollback below never
+        # force-removes the user's pre-existing worktree.
+        worktree = None
         if body.git is not None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
                 validate_branch_name,
             )
-            from omnigent.server.routes._host_worktree import (
-                WorktreeHostUnavailableError,
-                WorktreeProxyError,
-                create_worktree_on_host,
-            )
 
+            # Shared by both modes — the host never runs git in bind mode, so
+            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
-            try:
-                worktree = await create_worktree_on_host(
-                    host_registry=host_registry,
-                    host_conn=conn,
-                    repo_path=workspace,
-                    branch_name=body.git.branch_name,
-                    base_branch=body.git.base_branch,
+
+            if body.git.existing_worktree:
+                # Binding to a pre-existing worktree: no worktree is created,
+                # but record its branch so the sidebar shows it and the opt-in
+                # delete flow can offer to remove it.
+                git_branch = body.git.branch_name
+            else:
+                from omnigent.server.routes._host_worktree import (
+                    WorktreeHostUnavailableError,
+                    WorktreeProxyError,
+                    create_worktree_on_host,
                 )
-            except WorktreeHostUnavailableError as exc:
-                # Host offline / unresponsive — infra, not user input.
-                raise HTTPException(status_code=409, detail=exc.message) from exc
-            except WorktreeProxyError as exc:
-                # Host-reported git failure (dup branch, bad base, not a
-                # repo) — user-correctable input.
-                raise HTTPException(status_code=400, detail=exc.message) from exc
-            workspace = worktree.worktree_path
-            git_branch = worktree.branch
+
+                try:
+                    worktree = await create_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=conn,
+                        repo_path=workspace,
+                        branch_name=body.git.branch_name,
+                        base_branch=body.git.base_branch,
+                    )
+                except WorktreeHostUnavailableError as exc:
+                    # Host offline / unresponsive — infra, not user input.
+                    raise HTTPException(status_code=409, detail=exc.message) from exc
+                except WorktreeProxyError as exc:
+                    # Host-reported git failure (dup branch, bad base, not a
+                    # repo) — user-correctable input.
+                    raise HTTPException(status_code=400, detail=exc.message) from exc
+                workspace = worktree.worktree_path
+                git_branch = worktree.branch
 
         async def _rollback_worktree() -> None:
             """
@@ -618,6 +709,7 @@ def create_hosts_router(
                 request_id=request_id,
                 binding_token=binding_token,
                 workspace=workspace,
+                session_id=body.session_id,
                 harness=harness,
             )
         )
@@ -787,7 +879,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         if "\x00" in path:
@@ -868,7 +960,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
@@ -916,5 +1008,169 @@ def create_hosts_router(
             "object": "directory",
             "path": result.get("path"),
         }
+
+    @router.post("/hosts/{host_id}/harnesses/{harness}/install")
+    async def install_host_harness(
+        request: Request,
+        host_id: str,
+        harness: str,
+    ) -> dict[str, Any]:
+        """
+        Install a missing, npm-installable harness CLI onto a host.
+
+        Backs the Web UI's New Chat dialog "Install" action so a user can
+        install a harness the connected host is missing without dropping to a
+        terminal. Owner-scoped like the other host actions: only the host owner
+        may install onto it. Scoped to the UI-installable allowlist (claude,
+        codex, pi, opencode, qwen) — curl/brew and interactive-auth harnesses
+        are refused. The whole route is gated behind
+        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` (default off): when disabled it
+        returns 404 so the feature is invisible until opted in.
+
+        Concurrent requests for the same (host, harness) coalesce onto one
+        in-flight install so a double-click can't fire two global npm installs.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param harness: Harness identifier to install, e.g. ``"claude"``.
+        :returns: ``{"object": "harness_install", "harness": ...,
+            "configured_harnesses": {...}}`` — the host's refreshed readiness
+            map so the UI can flip the badge without a reconnect.
+        :raises HTTPException: 404 when the feature is disabled or the host is
+            unknown, 400 when the harness is not UI-installable, 403 when the
+            caller is not the host owner, 409 when the host is offline, 502 on
+            a host-side install failure, 504 on host timeout.
+        """
+        # Feature flag (default off): a disabled route is indistinguishable
+        # from a non-existent one, so the feature is fully dark until opted in.
+        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+            raise HTTPException(status_code=404, detail="not found")
+
+        # Allowlist (400) is checked before the ownership check (403) so error
+        # codes can't be used to enumerate host ownership. Never trust the
+        # client: the server is the source of truth for what is installable.
+        if harness not in ui_installable_harnesses():
+            raise HTTPException(
+                status_code=400,
+                detail=f"harness {harness!r} is not installable from the UI",
+            )
+
+        # require_user: unauthenticated callers 401 instead of slipping past
+        # the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        # Coalesce concurrent installs of the same harness FAMILY onto one
+        # in-flight request so a double-click (or `codex` + `codex-native`, which
+        # resolve to the same npm package) can't launch two global npm installs
+        # (npm's global writes aren't race-safe). Keyed on the resolved install
+        # key, not the raw spelling. The map lives on the connection, so it's
+        # discarded when the host disconnects.
+        #
+        # Cleanup is tied to the task's completion (add_done_callback), not the
+        # awaiter, and every caller awaits under a shield: if this request is
+        # cancelled (client disconnect) mid-install, the shared task keeps
+        # running to completion and stays in the map, so a follow-up request
+        # coalesces onto it instead of starting a second npm install.
+        install_key = ui_install_key(harness) or harness
+        existing = conn.inflight_installs.get(install_key)
+        if existing is None:
+            task = asyncio.create_task(
+                _proxy_install_harness(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    harness=harness,
+                )
+            )
+            conn.inflight_installs[install_key] = task
+            task.add_done_callback(lambda _t: conn.inflight_installs.pop(install_key, None))
+            existing = task
+        result = await asyncio.shield(existing)
+
+        if result.get("status") == "failed":
+            raise HTTPException(
+                status_code=502,
+                detail=f"host install failed: {result.get('error') or 'unknown error'}",
+            )
+
+        return {
+            "object": "harness_install",
+            "harness": harness,
+            "configured_harnesses": result.get("configured_harnesses") or {},
+        }
+
+    @router.get("/hosts/{host_id}/worktrees")
+    async def list_host_worktrees(
+        request: Request,
+        host_id: str,
+        path: str = Query(...),
+    ) -> dict[str, Any]:
+        """
+        List the git worktrees of a repository on a host.
+
+        Used by the Web UI's new-session worktree picker to show the
+        worktrees a session can start in directly. Owner-scoped exactly
+        like the filesystem browse endpoints; NOT scoped to a session.
+        A path that is not a git repository is reported as 400 so the
+        picker can quietly fall back to "no worktrees".
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param path: Absolute path inside the repo on the host to list
+            worktrees for, e.g. ``"/Users/alice/myrepo"``.
+        :returns: ``{"object": "list", "data": [{path, branch,
+            is_main, detached}, ...]}`` (main first).
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if host is offline/unresponsive, 400 on path
+            validation or a non-git path.
+        """
+        from omnigent.server.routes._host_worktree import (
+            WorktreeHostUnavailableError,
+            WorktreeProxyError,
+            list_worktrees_on_host,
+        )
+
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        try:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=conn,
+                repo_path=path,
+            )
+        except WorktreeHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except WorktreeProxyError as exc:
+            # Not a git repo / git failure — user-correctable; the picker
+            # treats this as "no worktrees here".
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+
+        return {"object": "list", "data": worktrees}
 
     return router

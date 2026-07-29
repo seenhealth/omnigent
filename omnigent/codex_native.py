@@ -37,6 +37,7 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    _find_codex_cli,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -60,12 +61,18 @@ from omnigent.codex_native_forwarder import supervise_forwarder
 from omnigent.codex_native_state import read_launch_state, write_launch_state
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
+    HarnessUnavailableReason,
+)
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -105,8 +112,6 @@ _UNBOUND_RUNNER_MESSAGE_FRAGMENT = "not bound to a runner"
 # hex + hyphens keeps it safe to interpolate into a rollout filename and a
 # ``codex resume`` argument (no path separators / traversal).
 _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
-_CODEX_AUTH_UNAVAILABLE_BINARY_MISSING = "binary-missing"
-_CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH = "needs-auth"
 
 
 @dataclass(frozen=True)
@@ -183,7 +188,7 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
     return False
 
 
-def _codex_auth_unavailable_reason() -> str | None:
+def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     """
     Return why local Codex is unavailable, or ``None`` when available.
 
@@ -211,14 +216,10 @@ def _codex_auth_unavailable_reason() -> str | None:
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
-    if shutil.which(_DEFAULT_CODEX_COMMAND) is None:
-        return _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING
-    # ponytail: resolve_native_codex_launch runs once per codex spelling
-    # (codex / codex-native / native-codex → 3×) per hello frame; on a host with
-    # NO configured provider it also runs ambient detection (a localhost ollama
-    # probe + a `claude auth status` subprocess). It's off the event loop and
-    # only bites unconfigured hosts — memoize the launch across the map build in
-    # configured_harness_map if that cost ever shows up.
+    if _find_codex_cli() is None:
+        return HARNESS_BINARY_MISSING
+    # On a host with no configured provider this may run ambient detection.
+    # configured_harness_map shares one probe across all Codex aliases.
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
@@ -231,7 +232,7 @@ def _codex_auth_unavailable_reason() -> str | None:
         return None
     source = _resolve_codex_auth_source()
     if not _codex_auth_json_has_available_credential(source.auth_path):
-        return _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH
+        return HARNESS_NEEDS_AUTH
     return None
 
 
@@ -526,21 +527,11 @@ def _materialize_codex_agent_spec(
         },
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped codex (the relay's
-        # gate is a non-empty ``terminals:`` block on this spec).
-        # Caller process / no sandbox matches the ``os_env`` stance
-        # above — the native CLI already runs unsandboxed on the
-        # user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # gate is a non-empty ``terminals:`` block on this spec). Its
+        # command follows the user's ``$SHELL`` (zsh/fish/bash); caller
+        # process / no sandbox matches the ``os_env`` stance above — the
+        # native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path

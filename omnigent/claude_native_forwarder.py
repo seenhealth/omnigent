@@ -228,6 +228,14 @@ _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+# A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
+# terminal sub-agent result to the parent inbox. It is retried (the work entry can
+# be created slightly after the child reports terminal — a short dispatch race), but
+# UNLIKE a generic 5xx it must NOT retry forever: when the parent host is gone the
+# condition is permanent. Bounded so a single orphaned sub-agent cannot flood the
+# shared server. The budget spans the backoff schedule (capped at 30 s) ⇒ a few
+# minutes, comfortably covering the dispatch race.
+_SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -527,6 +535,11 @@ class _ForwardDedupeState:
     # ``state.current_response_id`` unadvanced). ``None`` until the first
     # turn-start edge. Reset on /clear and /fork like the other baselines.
     posted_running_response_id: str | None = None
+    # Failed cost posts are retried by this long-running poll loop. Without a
+    # retry gate, an edge 429 turns the poll interval into a request storm and
+    # prevents the limiter from recovering.
+    cost_retry_not_before: float = 0.0
+    cost_retry_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -601,6 +614,7 @@ class _PostRetryTracker:
         self,
         *,
         max_permanent_attempts: int = _HTTP_POST_MAX_PERMANENT_FAILURES,
+        max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
     ) -> None:
@@ -609,11 +623,14 @@ class _PostRetryTracker:
 
         :param max_permanent_attempts: Attempts before a permanent
             failure is exhausted.
+        :param max_not_confirmed_attempts: Attempts before a
+            ``subagent_delivery_not_confirmed`` 503 is exhausted.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
         :returns: None.
         """
         self._max_permanent_attempts = max(1, max_permanent_attempts)
+        self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
@@ -663,13 +680,17 @@ class _PostRetryTracker:
             self._entries[key] = entry
         entry.attempts += 1
         permanent = _is_permanent_http_error(exc)
-        if permanent and entry.attempts >= self._max_permanent_attempts:
+        not_confirmed = _is_subagent_delivery_not_confirmed(exc)
+        give_up = (permanent and entry.attempts >= self._max_permanent_attempts) or (
+            not_confirmed and entry.attempts >= self._max_not_confirmed_attempts
+        )
+        if give_up:
             self._entries.pop(key, None)
             return _PostRetryDecision(
                 attempts=entry.attempts,
                 delay_s=0.0,
                 exhausted=True,
-                permanent=True,
+                permanent=permanent,
             )
         delay_s = min(
             self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
@@ -1764,6 +1785,8 @@ async def _forward_session_cost(
         mutated in place.
     :returns: None.
     """
+    if time.monotonic() < dedupe.cost_retry_not_before:
+        return
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
     status_cost = _cumulative_cost_from_status_state(status_state)
     active_subagents = [
@@ -1818,14 +1841,25 @@ async def _forward_session_cost(
             usage=payload,
         )
     except httpx.HTTPError as exc:
+        dedupe.cost_retry_failures += 1
+        delay = min(30.0, float(2 ** min(dedupe.cost_retry_failures - 1, 5)))
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            raw_retry_after = exc.response.headers.get("retry-after")
+            with contextlib.suppress(ValueError):
+                delay = max(delay, float(raw_retry_after)) if raw_retry_after else delay
+        dedupe.cost_retry_not_before = time.monotonic() + delay
         _logger.warning(
-            "Failed to forward Claude session cost; session=%s bridge_dir=%s http_status=%s",
+            "Failed to forward Claude session cost; session=%s bridge_dir=%s "
+            "http_status=%s retry_in=%.1fs",
             session_id,
             bridge_dir,
             _http_status_for_log(exc),
+            delay,
             exc_info=True,
         )
         return
+    dedupe.cost_retry_failures = 0
+    dedupe.cost_retry_not_before = 0.0
     if "cumulative_cost_usd" in payload:
         dedupe.posted_cost = display_cost
     if "policy_cost_usd" in payload:
@@ -2839,6 +2873,31 @@ async def _ensure_state_for_transcript(
     return state
 
 
+def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
+    """
+    Whether ``response_id`` has assistant-generated output among ``items``.
+
+    The turn-start ``running`` edge should open a streaming turn only for an id
+    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
+    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
+    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
+    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
+    turn behind it, so it must not.
+
+    :param items: Transcript items read this poll.
+    :param response_id: The current turn's response id.
+    :returns: ``True`` when an assistant-output item carries ``response_id``.
+    """
+    for item in items:
+        if item.response_id != response_id:
+            continue
+        if item.item_type == "function_call":
+            return True
+        if item.item_type == "message" and item.data.get("role") == "assistant":
+            return True
+    return False
+
+
 async def _forward_available_items(
     *,
     client: httpx.AsyncClient,
@@ -2902,9 +2961,19 @@ async def _forward_available_items(
     # status post must not abort item forwarding (the items below are the
     # primary payload); the turn-end idle/failed edge still carries the id to
     # close the lifecycle, and the badge is unaffected either way.
+    #
+    # Only open the streaming turn for an id that has ASSISTANT output in this
+    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
+    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
+    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
+    # close it — a ``running`` opened for it would strand the web composer in
+    # its "Stop"/busy state until the next real message. A skill that DOES
+    # trigger an LLM turn shares its id with the assistant text it produces, so
+    # ``running`` still fires — one poll later, when that output appears.
     if (
         current_response_id is not None
         and dedupe.posted_running_response_id != current_response_id
+        and _turn_has_assistant_output(items, current_response_id)
     ):
         try:
             await post_external_session_status(
@@ -3611,22 +3680,29 @@ def _model_alias_for(model: str | None) -> str | None:
     Collapse a concrete Claude model id to the picker's tier alias.
 
     The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``); the
+    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
+    extra concrete-id slot ``"sonnet_5"`` (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
+    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
     transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``).
+    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
     Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op.
+    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
+    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
+    default that row is bound to.
 
     :param model: Concrete model id from the transcript, e.g.
         ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``
-        when the id carries a known tier token, else ``None`` (the
-        caller skips the post rather than surface an id the picker
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
+        ``"haiku"`` when the id carries a known tier token, else ``None``
+        (the caller skips the post rather than surface an id the picker
         can't render).
     """
     if not model:
         return None
     lowered = model.lower()
+    if "sonnet-5" in lowered or "sonnet_5" in lowered:
+        return "sonnet_5"
     for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in lowered:
             return tier
@@ -4015,6 +4091,29 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
         return False
     status_code = exc.response.status_code
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
+
+
+def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` is a runner ``subagent_delivery_not_confirmed`` 503.
+
+    The runner returns this application-level 503 when a terminal sub-agent
+    payload could not be delivered to the parent inbox (no work entry / inbox).
+    It is a bounded-retry class, distinct from a generic transient 5xx.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` only for a 503 whose JSON body carries
+        ``error == "subagent_delivery_not_confirmed"``.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    if exc.response.status_code != 503:
+        return False
+    try:
+        body = exc.response.json()
+    except Exception:  # noqa: BLE001 — best-effort body parse
+        return False
+    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
