@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import importlib
 import sys
+import types
 from pathlib import Path
 from typing import NoReturn
 
+import httpx
 import pytest
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -198,3 +200,55 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
     from deploy.docker.entrypoint import _resolve_execution_timeout
 
     assert _resolve_execution_timeout(cfg) == expected_timeout
+
+
+@pytest.mark.asyncio
+async def test_build_app_loads_configured_policy_modules(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Docker config policy modules must reach the app's policy registry."""
+    from deploy.docker.entrypoint import _ResolvedConfig, build_app
+
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    fake_module = types.ModuleType("tests.fake_policy_module")
+
+    def allow_all(event: dict[str, object]) -> dict[str, str]:
+        return {"action": "ALLOW"}
+
+    fake_module.allow_all = allow_all
+    fake_module.POLICY_REGISTRY = [
+        {
+            "handler": "tests.fake_policy_module.allow_all",
+            "kind": "callable",
+            "name": "Allow All",
+            "description": "Test policy module entry",
+        }
+    ]
+    monkeypatch.setitem(sys.modules, "tests.fake_policy_module", fake_module)
+
+    built = build_app(
+        _ResolvedConfig(
+            cfg={"policy_modules": ["tests.fake_policy_module"]},
+            database_url=db_uri,
+            artifact_dir=tmp_path / "artifacts",
+            artifact_store_uri=None,
+            host="0.0.0.0",
+            port=8000,
+        )
+    )
+
+    async with built.app.router.lifespan_context(built.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=built.app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/v1/policy-registry")
+
+    assert response.status_code == 200
+    assert "tests.fake_policy_module.allow_all" in {
+        entry["handler"] for entry in response.json()["data"]
+    }
